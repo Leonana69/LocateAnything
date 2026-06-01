@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "locateanything"
+version = "1.0.0"
+description = "LocateAnything: Fast vision-language grounding with Parallel Box Decoding (inference library)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+]
+
+# Inference-only dependencies. flash-attn / magi-attention are optional speedups
+# (the model falls back to SDPA when they are absent) — see [project.optional-dependencies].
+dependencies = [
+    "torch",
+    "torchvision",
+    "transformers==4.57.1",
+    "tokenizers==0.22.0",
+    "numpy>=1.25",
+    "scipy>=1.13.0",
+    "pillow",
+    "peft==0.12.0",
+    "opencv-python-headless",
+    "decord",
+    "lmdb",
+    "requests",
+    "packaging",
+]
+
+[project.optional-dependencies]
+# Optional kernels for higher throughput on Hopper/Blackwell GPUs.
+speed = ["flash-attn", "einops"]
+# Dependencies for the Flask test server under scripts/.
+serve = ["flask", "werkzeug", "gunicorn"]
+
+[tool.setuptools.packages.find]
+include = ["locateanything*"]
+
+# Ship the model's JSON assets (chat template, processor / preprocessor configs)
+# inside the wheel so they travel with the code.
+[tool.setuptools.package-data]
+"locateanything.model" = ["*.json"]

@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LocateAnything</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#e6e9ef; --muted:#9aa4b2; --accent:#4f8cff; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; background:var(--bg); color:var(--txt); }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  header .status { font-size:12px; color:var(--muted); margin-left:auto; }
+  .wrap { display:flex; gap:18px; padding:18px; align-items:flex-start; flex-wrap:wrap; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .controls { width:320px; flex:0 0 320px; }
+  .controls label { display:block; font-size:12px; color:var(--muted); margin:12px 0 4px; }
+  .controls input[type=text], .controls select, .controls input[type=number] {
+    width:100%; padding:8px 10px; background:#0d0f14; border:1px solid var(--line); color:var(--txt);
+    border-radius:7px; font-size:13px; }
+  button.run { margin-top:16px; width:100%; padding:10px; background:var(--accent); color:#fff; border:0;
+    border-radius:8px; font-size:14px; font-weight:600; cursor:pointer; }
+  button.run:disabled { opacity:.5; cursor:default; }
+  .drop { border:1.5px dashed var(--line); border-radius:9px; padding:22px 14px; text-align:center;
+    color:var(--muted); cursor:pointer; word-break:break-word; }
+  .drop.drag { border-color:var(--accent); color:var(--txt); }
+  .view { flex:1 1 480px; min-width:340px; }
+  canvas { max-width:100%; height:auto; background:#0d0f14; border:1px solid var(--line); border-radius:9px; display:block; }
+  .meta { margin-top:12px; }
+  .pill { display:inline-block; font-size:11px; color:var(--muted); margin-right:12px; }
+  .answer { white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,Menlo,Consolas,monospace;
+    font-size:12px; color:var(--muted); background:#0d0f14; border:1px solid var(--line); border-radius:8px;
+    padding:10px; max-height:220px; overflow:auto; margin-top:8px; }
+  .answer.err { color:#ff6b6b; }
+  details summary { cursor:pointer; color:var(--muted); font-size:12px; margin-top:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎯 LocateAnything</h1>
+  <span class="status" id="status">connecting…</span>
+</header>
+<div class="wrap">
+  <div class="panel controls">
+    <div class="drop" id="drop">Click or drop an image here
+      <input type="file" id="file" accept="image/*" hidden>
+    </div>
+    <label>Task</label>
+    <select id="task"></select>
+    <div id="textWrap">
+      <label id="textLabel">Phrase</label>
+      <input type="text" id="text" placeholder="">
+    </div>
+    <div id="guiWrap" style="display:none">
+      <label>Output type</label>
+      <select id="outputType"><option value="box">box</option><option value="point">point</option></select>
+    </div>
+    <label>Inference mode</label>
+    <select id="mode">
+      <option value="hybrid">hybrid (default)</option>
+      <option value="fast">fast (MTP)</option>
+      <option value="slow">slow (NTP)</option>
+    </select>
+    <details>
+      <summary>Advanced</summary>
+      <label>max_new_tokens</label>
+      <input type="number" id="maxTokens" value="2048" min="1" max="8192">
+      <label>temperature</label>
+      <input type="number" id="temp" value="0.7" min="0" max="2" step="0.1">
+    </details>
+    <button class="run" id="run" disabled>Run</button>
+  </div>
+  <div class="panel view">
+    <canvas id="canvas" width="640" height="360"></canvas>
+    <div class="meta">
+      <div id="pills"></div>
+      <div class="answer" id="answer" style="display:none"></div>
+    </div>
+  </div>
+</div>
+<script>
+const TASKS = {
+  detect:        {label:"Object detection",         field:"categories", ph:"person, car, bicycle"},
+  ground_multi:  {label:"Phrase grounding — all",    field:"phrase",     ph:"people wearing red shirts"},
+  ground_single: {label:"Phrase grounding — single", field:"phrase",     ph:"the tallest person"},
+  point:         {label:"Pointing",                  field:"phrase",     ph:"the traffic light"},
+  ground_gui:    {label:"GUI grounding",             field:"phrase",     ph:"the search button", gui:true},
+  ground_text:   {label:"Text grounding",            field:"phrase",     ph:"the title text"},
+  detect_text:   {label:"Scene text detection",      field:null},
+  predict:       {label:"Free-form prompt",          field:"question",   ph:"Locate all the instances that match: red cars"},
+};
+const PALETTE = ["#4f8cff","#ff6b6b","#43d17a","#ffb84d","#b46bff","#23c9d4","#ff7ac6","#9acd32"];
+const $ = id => document.getElementById(id);
+const canvas = $("canvas"), ctx = canvas.getContext("2d");
+let currentImage = null, currentFile = null;
+
+function initTasks(){
+  const sel = $("task");
+  for (const [k, v] of Object.entries(TASKS)){
+    const o = document.createElement("option");
+    o.value = k; o.textContent = v.label; sel.appendChild(o);
+  }
+  sel.value = "detect";
+  sel.onchange = onTaskChange;
+  onTaskChange();
+}
+function onTaskChange(){
+  const t = TASKS[$("task").value];
+  $("textWrap").style.display = t.field ? "" : "none";
+  $("guiWrap").style.display = t.gui ? "" : "none";
+  if (t.field){
+    $("textLabel").textContent = t.field === "categories" ? "Categories (comma-separated)"
+      : (t.field === "question" ? "Prompt" : "Phrase");
+    $("text").placeholder = t.ph || "";
+  }
+}
+
+const drop = $("drop"), fileInput = $("file");
+drop.onclick = () => fileInput.click();
+fileInput.onchange = e => { if (e.target.files[0]) loadFile(e.target.files[0]); };
+["dragover","dragenter"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("drag"); }));
+["dragleave","drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("drag"); }));
+drop.addEventListener("drop", e => { const f = e.dataTransfer.files[0]; if (f) loadFile(f); });
+
+function loadFile(f){
+  if (!f.type.startsWith("image/")) { showError("Please choose an image file."); return; }
+  currentFile = f;
+  const img = new Image();
+  img.onload = () => {
+    currentImage = img;
+    drawResult([], [], []);
+    $("run").disabled = false;
+    $("answer").style.display = "none";
+    $("pills").innerHTML = "";
+  };
+  img.src = URL.createObjectURL(f);
+  drop.textContent = f.name;
+}
+
+function drawResult(boxes, points, labels){
+  if (!currentImage) return;
+  canvas.width = currentImage.naturalWidth;
+  canvas.height = currentImage.naturalHeight;
+  ctx.drawImage(currentImage, 0, 0);
+  const lw = Math.max(2, canvas.width / 400);
+  const fs = Math.max(12, Math.round(canvas.width / 55));
+  ctx.font = fs + "px sans-serif";
+  ctx.textBaseline = "top";
+  boxes.forEach((b, i) => {
+    const c = PALETTE[i % PALETTE.length];
+    ctx.lineWidth = lw; ctx.strokeStyle = c;
+    ctx.strokeRect(b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1);
+    const lab = labels[i];
+    if (lab){
+      const tw = ctx.measureText(lab).width;
+      const ty = Math.max(0, b.y1 - fs - 4);
+      ctx.fillStyle = c; ctx.fillRect(b.x1, ty, tw + 8, fs + 4);
+      ctx.fillStyle = "#fff"; ctx.fillText(lab, b.x1 + 4, ty + 2);
+    }
+  });
+  points.forEach((p, i) => {
+    const c = PALETTE[i % PALETTE.length];
+    const r = Math.max(4, canvas.width / 180);
+    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, 2 * Math.PI);
+    ctx.globalAlpha = .85; ctx.fillStyle = c; ctx.fill(); ctx.globalAlpha = 1;
+    ctx.lineWidth = lw; ctx.strokeStyle = "#fff"; ctx.stroke();
+  });
+}
+
+// Best-effort label extraction: only annotate when ref count matches box count.
+function extractLabels(answer, n){
+  const refs = [...answer.matchAll(/<ref>(.*?)<\/ref>/g)].map(m => m[1].trim());
+  return refs.length === n ? refs : new Array(n).fill("");
+}
+
+async function run(){
+  if (!currentFile) return;
+  const task = $("task").value, t = TASKS[task];
+  const fd = new FormData();
+  fd.append("image", currentFile);
+  if (t.field){
+    const v = $("text").value.trim();
+    if (!v){ showError("Please enter " + (t.field === "categories" ? "one or more categories." : "a phrase/prompt.")); return; }
+    fd.append(t.field, v);
+  }
+  if (t.gui) fd.append("output_type", $("outputType").value);
+  fd.append("generation_mode", $("mode").value);
+  fd.append("max_new_tokens", $("maxTokens").value);
+  fd.append("temperature", $("temp").value);
+
+  const btn = $("run");
+  btn.disabled = true; btn.textContent = "Running…";
+  $("pills").innerHTML = ""; $("answer").style.display = "none";
+  const t0 = performance.now();
+  try {
+    const res = await fetch("/" + task, { method: "POST", body: fd });
+    const data = await res.json();
+    if (!res.ok){ showError(data.error || ("HTTP " + res.status)); return; }
+    const ms = Math.round(performance.now() - t0);
+    const boxes = data.boxes || [], points = data.points || [];
+    drawResult(boxes, points, extractLabels(data.answer || "", boxes.length));
+    const pills = [boxes.length + " boxes", points.length + " points", ms + " ms round-trip"];
+    $("pills").innerHTML = pills.map(p => '<span class="pill">' + p + "</span>").join("");
+    const ans = $("answer");
+    ans.style.display = ""; ans.classList.remove("err");
+    let text = data.answer || "(empty answer)";
+    if (data.stats) text += "\n\nstats: " + JSON.stringify(data.stats);
+    ans.textContent = text;
+  } catch (e) {
+    showError(e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = "Run";
+  }
+}
+function showError(msg){
+  const ans = $("answer");
+  ans.style.display = ""; ans.classList.add("err");
+  ans.textContent = "Error: " + msg;
+  $("pills").innerHTML = "";
+}
+$("run").onclick = run;
+
+async function checkHealth(){
+  try {
+    const r = await fetch("/health");
+    const d = await r.json();
+    if (d.model_loaded){
+      $("status").textContent = "model: " + (d.model_path || "loaded") + (d.device ? " · " + d.device : "");
+      $("status").classList.remove("err");
+    } else {
+      $("status").textContent = "model loading…";
+      $("status").classList.add("err");
+      setTimeout(checkHealth, 3000);
+    }
+  } catch (e) {
+    $("status").textContent = "server unreachable";
+    $("status").classList.add("err");
+    setTimeout(checkHealth, 3000);
+  }
+}
+initTasks();
+checkHealth();
+</script>
+</body>
+</html>
