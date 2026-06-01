@@ -13,28 +13,168 @@ The model code is vendored locally (see ``locateanything.model``); importing it
 registers the custom classes with the transformers ``Auto*`` registries, so the
 weights load *without* ``trust_remote_code=True``.
 """
+import importlib.util
 import re
 
 import torch
 from PIL import Image
-from transformers import AutoModel, AutoProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoProcessor, AutoTokenizer
+from transformers.utils import is_flash_attn_2_available
 
 # Importing the model package registers LocateAnything with the Auto* factories.
 from . import model as _model  # noqa: F401
 
 
+def _magi_available() -> bool:
+    return importlib.util.find_spec("magi_attention") is not None
+
+
+def _single_device_map(device: str) -> dict:
+    """A device_map that pins the whole model to one device — what bitsandbytes needs."""
+    dev = torch.device(device)
+    target = (dev.index if dev.index is not None else 0) if dev.type == "cuda" else dev.type
+    return {"": target}
+
+
+def _build_quantization_config(load_in_8bit: bool, load_in_4bit: bool, dtype, device: str):
+    """Build a BitsAndBytesConfig for int8/nf4 loading, or None for full precision.
+
+    Quantization is opt-in; when neither flag is set the model loads in ``dtype`` as
+    before. int8/4bit need a CUDA device and the ``bitsandbytes`` package.
+    """
+    if load_in_8bit and load_in_4bit:
+        raise ValueError("Choose at most one of load_in_8bit / load_in_4bit, not both.")
+    if not (load_in_8bit or load_in_4bit):
+        return None
+    if torch.device(device).type != "cuda":
+        raise ValueError("8-bit / 4-bit quantization requires a CUDA device.")
+    if importlib.util.find_spec("bitsandbytes") is None:
+        raise ImportError(
+            "8-bit / 4-bit loading needs the 'bitsandbytes' package "
+            "(pip install bitsandbytes)."
+        )
+    from transformers import BitsAndBytesConfig
+
+    if load_in_8bit:
+        # LLM.int8(): linear weights stored in int8, outliers + activations kept in
+        # fp16. Roughly halves weight memory with negligible quality loss; the vision
+        # encoder, connector and lm_head still compute in higher precision.
+        return BitsAndBytesConfig(load_in_8bit=True)
+    # 4-bit NF4 with double quantization: ~4x smaller weights, matmuls run in `dtype`.
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=dtype,
+    )
+
+
 class LocateAnythingWorker:
     """Stateful worker that loads the model once and serves perception queries."""
 
-    def __init__(self, model_path: str, device: str = "cuda", dtype=torch.bfloat16):
+    def __init__(
+        self,
+        model_path: str,
+        device: str = "cuda",
+        dtype=torch.bfloat16,
+        vision_attn: str | None = None,
+        text_attn: str | None = None,
+        compile_target: str = "none",
+        compile_mode: str = "default",
+        load_in_8bit: bool = False,
+        load_in_4bit: bool = False,
+    ):
+        """
+        Args:
+            model_path: HF id or local dir with the weights.
+            device: torch device (e.g. "cuda").
+            dtype: model dtype; FA2 requires bfloat16/float16.
+            vision_attn: attention backend for the Moon-ViT encoder
+                ("flash_attention_2" | "sdpa" | "eager"). ``None`` -> FA2 if
+                available, else sdpa.
+            text_attn: attention backend for the Qwen2 decoder. NOTE: the decoder's
+                Parallel Box Decoding only supports "magi" or "sdpa" — there is no
+                flash_attention_2 path (see modeling_qwen2.py:1321-1335). ``None``
+                -> "magi" if the ``magi_attention`` package is importable, else
+                "sdpa". (Do not force "flash_attention_2" here; it raises.)
+            compile_target: which submodule(s) to ``torch.compile``:
+                "none" | "vision" | "llm" | "both". Experimental — the dynamic
+                shapes / PBD loop may trigger recompiles or graph breaks.
+            compile_mode: ``torch.compile`` mode ("default", "reduce-overhead", ...).
+            load_in_8bit: load linear weights as int8 (bitsandbytes LLM.int8()).
+                ~halves weight memory; CUDA + ``bitsandbytes`` required. Box accuracy
+                is preserved in practice. Mutually exclusive with ``load_in_4bit``.
+            load_in_4bit: load weights as 4-bit NF4 (bitsandbytes). ~4x smaller
+                weights, slightly larger quality hit than int8.
+        """
         self.device = device
         self.dtype = dtype
 
+        # Resolve per-tower attention. The decoder must stay on magi/sdpa; with
+        # flash-attn installed the model's own default would pick FA2 for the
+        # decoder and crash, so we pin a supported impl here.
+        vision_attn = vision_attn or ("flash_attention_2" if is_flash_attn_2_available() else "sdpa")
+        text_attn = text_attn or ("magi" if _magi_available() else "sdpa")
+
+        config = AutoConfig.from_pretrained(model_path)
+        config.vision_config._attn_implementation = vision_attn
+        config.text_config._attn_implementation = text_attn
+        self.vision_attn = vision_attn
+        self.text_attn = text_attn
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.processor = AutoProcessor.from_pretrained(model_path)
-        self.model = (
-            AutoModel.from_pretrained(model_path, torch_dtype=dtype).to(device).eval()
-        )
+
+        quantization_config = _build_quantization_config(load_in_8bit, load_in_4bit, dtype, device)
+        self.quantization = "8bit" if load_in_8bit else "4bit" if load_in_4bit else None
+        if quantization_config is None:
+            self.model = (
+                AutoModel.from_pretrained(model_path, config=config, dtype=dtype)
+                .to(device).eval()
+            )
+        else:
+            # bitsandbytes places the quantized weights on the device itself via
+            # device_map; calling .to() on a quantized model raises, so we never move
+            # it afterwards. `dtype` still governs the non-quantized modules.
+            self.model = AutoModel.from_pretrained(
+                model_path,
+                config=config,
+                dtype=dtype,
+                quantization_config=quantization_config,
+                device_map=_single_device_map(device),
+            ).eval()
+
+        self._maybe_compile(compile_target, compile_mode)
+
+    def _maybe_compile(self, compile_target: str, compile_mode: str) -> None:
+        """Optionally ``torch.compile`` the vision and/or language submodules.
+
+        Wrapped in try/except so a compile failure never breaks inference — on
+        error we log and keep the eager module.
+        """
+        if compile_target == "none":
+            return
+        targets = {
+            "vision": ["vision_model"],
+            "llm": ["language_model"],
+            "both": ["vision_model", "language_model"],
+        }.get(compile_target)
+        if targets is None:
+            raise ValueError(
+                f"compile_target must be none|vision|llm|both, got {compile_target!r}"
+            )
+        for name in targets:
+            module = getattr(self.model, name, None)
+            if module is None:
+                continue
+            try:
+                compiled = torch.compile(module, mode=compile_mode, dynamic=True)
+                setattr(self.model, name, compiled)
+                print(f"[locateanything] torch.compile enabled on {name} "
+                      f"(mode={compile_mode}, dynamic=True)", flush=True)
+            except Exception as exc:  # pragma: no cover - environment dependent
+                print(f"[locateanything] torch.compile on {name} failed "
+                      f"({exc}); using eager.", flush=True)
 
     @torch.no_grad()
     def predict(

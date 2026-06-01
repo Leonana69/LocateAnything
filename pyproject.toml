@@ -36,6 +36,8 @@ dependencies = [
 speed = ["flash-attn", "einops"]
 # Dependencies for the Flask test server under scripts/.
 serve = ["flask", "werkzeug", "gunicorn"]
+# Optional int8 / 4-bit weight quantization (lower GPU memory) — see worker load_in_8bit.
+quant = ["bitsandbytes"]
 
 [tool.setuptools.packages.find]
 include = ["locateanything*"]

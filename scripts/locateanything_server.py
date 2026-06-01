@@ -95,6 +95,7 @@ _config = {
     "model_path": None,
     "device": None,
     "dtype": None,
+    "quantization": None,
     "allow_url_fetch": False,
     "allow_local_paths": False,
     "max_image_bytes": int(DEFAULT_MAX_IMAGE_MB * 1024 * 1024),
@@ -107,15 +108,18 @@ def load_model(model_path: str, device: str = "cuda", dtype: str = "bfloat16",
                allow_url_fetch: bool = False, allow_local_paths: bool = False,
                max_image_mb: float = 25.0,
                max_image_pixels: int = DEFAULT_MAX_IMAGE_PIXELS,
-               max_fetch_seconds: float = DEFAULT_MAX_FETCH_SECONDS) -> None:
+               max_fetch_seconds: float = DEFAULT_MAX_FETCH_SECONDS,
+               load_in_8bit: bool = False, load_in_4bit: bool = False) -> None:
     """Load the model into the global worker. Call once before serving."""
     global _worker
     if dtype not in DTYPES:
         raise ValueError(f"dtype must be one of {sorted(DTYPES)}, got {dtype!r}")
+    quantization = "8bit" if load_in_8bit else "4bit" if load_in_4bit else None
     _config.update({
         "model_path": model_path,
         "device": device,
         "dtype": dtype,
+        "quantization": quantization,
         "allow_url_fetch": allow_url_fetch,
         "allow_local_paths": allow_local_paths,
         "max_image_bytes": int(max_image_mb * 1024 * 1024),
@@ -123,8 +127,10 @@ def load_model(model_path: str, device: str = "cuda", dtype: str = "bfloat16",
         "max_fetch_seconds": float(max_fetch_seconds),
     })
     app.config["MAX_CONTENT_LENGTH"] = _body_cap(max_image_mb)
-    print(f"[locateanything] loading {model_path} on {device} ({dtype}) ...", flush=True)
-    _worker = LocateAnythingWorker(model_path, device=device, dtype=DTYPES[dtype])
+    quant_note = f", {quantization}" if quantization else ""
+    print(f"[locateanything] loading {model_path} on {device} ({dtype}{quant_note}) ...", flush=True)
+    _worker = LocateAnythingWorker(model_path, device=device, dtype=DTYPES[dtype],
+                                   load_in_8bit=load_in_8bit, load_in_4bit=load_in_4bit)
     print("[locateanything] model ready.", flush=True)
 
 
@@ -333,6 +339,7 @@ def health():
         "model_path": _config["model_path"],
         "device": _config["device"],
         "dtype": _config["dtype"],
+        "quantization": _config["quantization"],
     }
     # 503 until the model is loaded so readiness probes don't route traffic early.
     return jsonify(payload), (200 if loaded else 503)
@@ -464,12 +471,17 @@ def main():
                         help="reject images whose width*height exceeds this (bomb guard)")
     parser.add_argument("--max-fetch-seconds", type=float, default=DEFAULT_MAX_FETCH_SECONDS,
                         help="wall-clock limit for --allow-url-fetch downloads")
+    parser.add_argument("--load-in-8bit", action="store_true", default=_env_bool("LA_LOAD_IN_8BIT", False),
+                        help="load weights as int8 (bitsandbytes) to roughly halve GPU memory")
+    parser.add_argument("--load-in-4bit", action="store_true", default=_env_bool("LA_LOAD_IN_4BIT", False),
+                        help="load weights as 4-bit NF4 (bitsandbytes); smallest footprint")
     args = parser.parse_args()
 
     load_model(args.model_path, device=args.device, dtype=args.dtype,
                allow_url_fetch=args.allow_url_fetch, allow_local_paths=args.allow_local_paths,
                max_image_mb=args.max_image_mb, max_image_pixels=args.max_image_pixels,
-               max_fetch_seconds=args.max_fetch_seconds)
+               max_fetch_seconds=args.max_fetch_seconds,
+               load_in_8bit=args.load_in_8bit, load_in_4bit=args.load_in_4bit)
     # threaded=True keeps /health responsive during inference; the GPU lock
     # serializes the actual model calls. Use one process (the model is large).
     app.run(host=args.host, port=args.port, threaded=True)
@@ -488,6 +500,8 @@ if __name__ != "__main__" and _worker is None and os.environ.get("LA_MODEL_PATH"
         max_image_mb=DEFAULT_MAX_IMAGE_MB,
         max_image_pixels=DEFAULT_MAX_IMAGE_PIXELS,
         max_fetch_seconds=DEFAULT_MAX_FETCH_SECONDS,
+        load_in_8bit=_env_bool("LA_LOAD_IN_8BIT", False),
+        load_in_4bit=_env_bool("LA_LOAD_IN_4BIT", False),
     )
 
 

@@ -17,6 +17,15 @@ PORT=${PORT:-8000}
 DEVICE=${DEVICE:-"cuda"}
 DTYPE=${DTYPE:-"bfloat16"}
 
+# Optional weight quantization (needs bitsandbytes). Set LOAD_IN_8BIT=1 to roughly
+# halve GPU memory, or LOAD_IN_4BIT=1 for the smallest footprint. (The server also
+# honors the LA_LOAD_IN_8BIT / LA_LOAD_IN_4BIT env vars directly.)
+LOAD_IN_8BIT=${LOAD_IN_8BIT:-${LA_LOAD_IN_8BIT:-0}}
+LOAD_IN_4BIT=${LOAD_IN_4BIT:-${LA_LOAD_IN_4BIT:-0}}
+EXTRA_ARGS=()
+[ "$LOAD_IN_8BIT" = "1" ] && EXTRA_ARGS+=(--load-in-8bit)
+[ "$LOAD_IN_4BIT" = "1" ] && EXTRA_ARGS+=(--load-in-4bit)
+
 HERE="$(dirname "$0")"
 
 python "$HERE/locateanything_server.py" \
@@ -25,4 +34,5 @@ python "$HERE/locateanything_server.py" \
     --port "$PORT" \
     --device "$DEVICE" \
     --dtype "$DTYPE" \
+    "${EXTRA_ARGS[@]}" \
     "$@"
